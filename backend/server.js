@@ -3,22 +3,25 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
-import fs from "fs/promises";
-import path from "path";
-import { fileURLToPath } from "url";
+import {
+  authenticateUser,
+  getUserSupabaseClient,
+} from "./supabase.js";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const DATA_FILE = path.join(__dirname, "data.json");
-
 if (!process.env.GEMINI_API_KEY) {
   throw new Error("GEMINI_API_KEY is missing from the environment.");
+}
+
+if (
+  !process.env.SUPABASE_URL ||
+  !process.env.SUPABASE_PUBLISHABLE_KEY
+) {
+  throw new Error("Supabase environment variables are missing.");
 }
 
 const ai = new GoogleGenAI({
@@ -28,48 +31,49 @@ const ai = new GoogleGenAI({
 app.use(cors());
 app.use(express.json());
 
-let database = {
-  expenses: [],
-  tasks: [],
-};
+// ----------------------------------
+// AUTHENTICATION MIDDLEWARE
+// ----------------------------------
 
-// -------------------------------
-// DATABASE FUNCTIONS
-// -------------------------------
-
-async function loadData() {
+async function requireAuth(req, res, next) {
   try {
-    const content = await fs.readFile(DATA_FILE, "utf-8");
-    const savedData = JSON.parse(content);
+    const authHeader = req.headers.authorization;
 
-    database = {
-      expenses: Array.isArray(savedData.expenses)
-        ? savedData.expenses
-        : [],
-      tasks: Array.isArray(savedData.tasks)
-        ? savedData.tasks
-        : [],
-    };
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      await saveData();
-    } else {
-      throw error;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "Please log in to continue.",
+      });
     }
+
+    const token = authHeader.slice(7);
+
+    const user = await authenticateUser(token);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid or expired session. Please log in again.",
+      });
+    }
+
+    req.user = user;
+    req.supabase = getUserSupabaseClient(token);
+
+    next();
+  } catch (error) {
+    console.error("Authentication error:", error.message);
+
+    return res.status(401).json({
+      success: false,
+      message: "Authentication failed.",
+    });
   }
 }
 
-async function saveData() {
-  await fs.writeFile(
-    DATA_FILE,
-    JSON.stringify(database, null, 2),
-    "utf-8"
-  );
-}
-
-// -------------------------------
+// ----------------------------------
 // GEMINI AI WITH RETRY HANDLING
-// -------------------------------
+// ----------------------------------
 
 async function generateAIResponse(prompt) {
   const maxAttempts = 3;
@@ -96,6 +100,7 @@ async function generateAIResponse(prompt) {
         attempt < maxAttempts
       ) {
         const delay = attempt * 2000;
+
         console.log(`Retrying in ${delay / 1000} seconds...`);
 
         await new Promise(resolve => setTimeout(resolve, delay));
@@ -109,9 +114,9 @@ async function generateAIResponse(prompt) {
   throw new Error("Gemini AI is temporarily unavailable.");
 }
 
-// -------------------------------
+// ----------------------------------
 // UNDERSTAND USER COMMAND
-// -------------------------------
+// ----------------------------------
 
 async function understandCommand(command) {
   const today = new Date().toISOString().split("T")[0];
@@ -156,7 +161,7 @@ Rules:
 - If the user asks for total spending across all time, use show_total.
 - If the user asks to mark, finish, or complete a task, use complete_task.
 - For complete_task, put the task name in the task field.
-- If the user asks how much they spent in a particular category this month, use expense_insights.
+- If the user asks about spending in a particular category this month, use expense_insights.
 - For expense_insights, put the category in category.
 - If the user asks about spending across all categories this month, use expense_insights with an empty category.
 - For unrelated or unclear commands, use general.
@@ -175,36 +180,94 @@ User command: ${JSON.stringify(command)}
   return JSON.parse(result);
 }
 
-// -------------------------------
+// ----------------------------------
+// FORMAT DATABASE ROWS FOR FRONTEND
+// ----------------------------------
+
+function formatExpense(item) {
+  return {
+    id: item.id,
+    amount: Number(item.amount),
+    category: item.category,
+    description: item.description,
+    date: item.date,
+    createdAt: item.created_at,
+  };
+}
+
+function formatTask(item) {
+  return {
+    id: item.id,
+    title: item.title,
+    dueDate: item.due_date,
+    completed: item.completed,
+    createdAt: item.created_at,
+    completedAt: item.completed_at,
+  };
+}
+
+// ----------------------------------
 // HEALTH CHECK
-// -------------------------------
+// ----------------------------------
 
 app.get("/", (req, res) => {
   res.json({
     message: "MyVoice AI backend is running!",
     model: "gemini-flash-lite-latest",
+    database: "Supabase PostgreSQL",
+    authentication: "Supabase Auth",
     features: [
+      "User authentication",
       "Voice expense tracking",
       "Task management",
       "Task completion",
       "Expense insights",
+      "User-specific data",
     ],
   });
 });
 
-// -------------------------------
-// GET ALL SAVED DATA
-// -------------------------------
+// ----------------------------------
+// GET LOGGED-IN USER'S DATA
+// ----------------------------------
 
-app.get("/api/data", (req, res) => {
-  res.json(database);
+app.get("/api/data", requireAuth, async (req, res) => {
+  try {
+    const { data: expenseRows, error: expenseError } =
+      await req.supabase
+        .from("expenses")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+    if (expenseError) throw expenseError;
+
+    const { data: taskRows, error: taskError } =
+      await req.supabase
+        .from("tasks")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+    if (taskError) throw taskError;
+
+    res.json({
+      expenses: expenseRows.map(formatExpense),
+      tasks: taskRows.map(formatTask),
+    });
+  } catch (error) {
+    console.error("Dashboard data error:", error.message);
+
+    res.status(500).json({
+      success: false,
+      message: "Unable to load your saved data.",
+    });
+  }
 });
 
-// -------------------------------
-// PROCESS USER COMMAND
-// -------------------------------
+// ----------------------------------
+// PROCESS AUTHENTICATED USER COMMAND
+// ----------------------------------
 
-app.post("/api/command", async (req, res) => {
+app.post("/api/command", requireAuth, async (req, res) => {
   try {
     const { command } = req.body;
 
@@ -219,7 +282,8 @@ app.post("/api/command", async (req, res) => {
       });
     }
 
-    console.log("User command:", command);
+    console.log("User:", req.user.id);
+    console.log("Command:", command);
 
     const aiResult = await understandCommand(command);
 
@@ -232,12 +296,14 @@ app.post("/api/command", async (req, res) => {
     let task = null;
     let total = 0;
 
+    let expenses = [];
+    let tasks = [];
+
+    // ----------------------------------
+    // ADD EXPENSE
+    // ----------------------------------
+
     switch (aiResult.intent) {
-
-      // ---------------------------
-      // ADD EXPENSE
-      // ---------------------------
-
       case "add_expense": {
         const amount = Number(aiResult.amount);
 
@@ -248,25 +314,33 @@ app.post("/api/command", async (req, res) => {
           });
         }
 
-        expense = {
-          id: Date.now().toString(),
-          amount,
-          category: aiResult.category || "Other",
-          description: aiResult.description || "Expense",
-          date: aiResult.date || new Date().toISOString().split("T")[0],
-          createdAt: new Date().toISOString(),
-        };
+        const { data, error } = await req.supabase
+          .from("expenses")
+          .insert({
+            user_id: req.user.id,
+            amount,
+            category: aiResult.category || "Other",
+            description: aiResult.description || "Expense",
+            date:
+              aiResult.date ||
+              new Date().toISOString().split("T")[0],
+          })
+          .select()
+          .single();
 
-        database.expenses.push(expense);
-        await saveData();
+        if (error) throw error;
 
-        message = `Successfully saved your expense of ₹${amount} for ${expense.description}.`;
+        expense = formatExpense(data);
+
+        message =
+          `Successfully saved your expense of ₹${amount} for ${expense.description}.`;
+
         break;
       }
 
-      // ---------------------------
+      // ----------------------------------
       // ADD TASK
-      // ---------------------------
+      // ----------------------------------
 
       case "add_task": {
         const taskDescription = (
@@ -280,53 +354,73 @@ app.post("/api/command", async (req, res) => {
           });
         }
 
-        task = {
-          id: Date.now().toString(),
-          title: taskDescription,
-          dueDate: aiResult.dueDate || null,
-          completed: false,
-          createdAt: new Date().toISOString(),
-        };
+        const { data, error } = await req.supabase
+          .from("tasks")
+          .insert({
+            user_id: req.user.id,
+            title: taskDescription,
+            due_date: aiResult.dueDate || null,
+            completed: false,
+          })
+          .select()
+          .single();
 
-        database.tasks.push(task);
-        await saveData();
+        if (error) throw error;
+
+        task = formatTask(data);
 
         message = `Your task has been added: ${task.title}.`;
+
         break;
       }
 
-      // ---------------------------
+      // ----------------------------------
       // SHOW EXPENSES
-      // ---------------------------
+      // ----------------------------------
 
       case "show_expenses": {
-        message = database.expenses.length
-          ? `You have ${database.expenses.length} saved expenses.`
+        const { data, error } = await req.supabase
+          .from("expenses")
+          .select("id")
+          .order("created_at", { ascending: false });
+
+        if (error) throw error;
+
+        message = data.length
+          ? `You have ${data.length} saved expenses.`
           : "You have no expenses saved yet.";
+
         break;
       }
 
-      // ---------------------------
+      // ----------------------------------
       // SHOW TASKS
-      // ---------------------------
+      // ----------------------------------
 
       case "show_tasks": {
-        const pendingTasks = database.tasks.filter(
+        const { data, error } = await req.supabase
+          .from("tasks")
+          .select("completed");
+
+        if (error) throw error;
+
+        const pendingTasks = data.filter(
           item => !item.completed
         ).length;
 
-        const completedTasks = database.tasks.filter(
+        const completedTasks = data.filter(
           item => item.completed
         ).length;
 
         message =
           `You have ${pendingTasks} pending tasks and ${completedTasks} completed tasks.`;
+
         break;
       }
 
-      // ---------------------------
+      // ----------------------------------
       // COMPLETE TASK BY VOICE
-      // ---------------------------
+      // ----------------------------------
 
       case "complete_task": {
         const requestedTask = (
@@ -334,75 +428,97 @@ app.post("/api/command", async (req, res) => {
         ).toLowerCase().trim();
 
         if (!requestedTask) {
-          message = "Please tell me which task you want to complete.";
+          message =
+            "Please tell me which task you want to complete.";
           break;
         }
 
-        const matchingTask = database.tasks.find(item => {
+        const { data: pendingTasks, error } = await req.supabase
+          .from("tasks")
+          .select("*")
+          .eq("completed", false);
+
+        if (error) throw error;
+
+        const matchingTask = pendingTasks.find(item => {
           const savedTitle = item.title.toLowerCase();
 
           return (
-            !item.completed &&
-            (
-              savedTitle.includes(requestedTask) ||
-              requestedTask.includes(savedTitle)
-            )
+            savedTitle.includes(requestedTask) ||
+            requestedTask.includes(savedTitle)
           );
         });
 
         if (!matchingTask) {
-          message = `I couldn't find an incomplete task matching ${requestedTask}.`;
+          message =
+            `I couldn't find an incomplete task matching ${requestedTask}.`;
           break;
         }
 
-        matchingTask.completed = true;
-        matchingTask.completedAt = new Date().toISOString();
+        const { data, error: updateError } = await req.supabase
+          .from("tasks")
+          .update({
+            completed: true,
+            completed_at: new Date().toISOString(),
+          })
+          .eq("id", matchingTask.id)
+          .select()
+          .single();
 
-        await saveData();
+        if (updateError) throw updateError;
 
-        task = matchingTask;
+        task = formatTask(data);
 
         message =
-          `Great! Your task ${matchingTask.title} has been marked as completed.`;
+          `Great! Your task ${task.title} has been marked as completed.`;
 
         break;
       }
 
-      // ---------------------------
+      // ----------------------------------
       // SHOW ALL-TIME EXPENSE TOTAL
-      // ---------------------------
+      // ----------------------------------
 
       case "show_total": {
-        total = database.expenses.reduce(
+        const { data, error } = await req.supabase
+          .from("expenses")
+          .select("amount");
+
+        if (error) throw error;
+
+        total = data.reduce(
           (sum, item) => sum + Number(item.amount || 0),
           0
         );
 
-        message = `Your total recorded spending is ₹${total}.`;
+        message =
+          `Your total recorded spending is ₹${total}.`;
+
         break;
       }
 
-      // ---------------------------
-      // SMART MONTHLY EXPENSE INSIGHTS
-      // ---------------------------
+      // ----------------------------------
+      // MONTHLY EXPENSE INSIGHTS
+      // ----------------------------------
 
       case "expense_insights": {
         const now = new Date();
 
-        const currentMonth = now.getMonth();
-        const currentYear = now.getFullYear();
+        const currentMonth = now.toISOString().slice(0, 7);
 
         const requestedCategory = (
           aiResult.category || ""
         ).toLowerCase().trim();
 
-        const filteredExpenses = database.expenses.filter(item => {
-          const expenseDate = new Date(item.date);
+        const { data, error } = await req.supabase
+          .from("expenses")
+          .select("*");
 
+        if (error) throw error;
+
+        const filteredExpenses = data.filter(item => {
           const isCurrentMonth =
-            !Number.isNaN(expenseDate.getTime()) &&
-            expenseDate.getMonth() === currentMonth &&
-            expenseDate.getFullYear() === currentYear;
+            item.date?.slice(0, 7) === currentMonth;
 
           const matchesCategory =
             !requestedCategory ||
@@ -427,9 +543,9 @@ app.post("/api/command", async (req, res) => {
         break;
       }
 
-      // ---------------------------
+      // ----------------------------------
       // GENERAL COMMAND
-      // ---------------------------
+      // ----------------------------------
 
       default: {
         message =
@@ -438,14 +554,37 @@ app.post("/api/command", async (req, res) => {
       }
     }
 
+    // ----------------------------------
+    // RETURN UPDATED USER DATA
+    // ----------------------------------
+
+    const { data: expenseRows, error: expenseError } =
+      await req.supabase
+        .from("expenses")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+    if (expenseError) throw expenseError;
+
+    const { data: taskRows, error: taskError } =
+      await req.supabase
+        .from("tasks")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+    if (taskError) throw taskError;
+
+    expenses = expenseRows.map(formatExpense);
+    tasks = taskRows.map(formatTask);
+
     res.json({
       success: true,
       intent: aiResult.intent,
       message,
       expense,
       task,
-      expenses: database.expenses,
-      tasks: database.tasks,
+      expenses,
+      tasks,
       total,
     });
 
@@ -462,28 +601,16 @@ app.post("/api/command", async (req, res) => {
   }
 });
 
-// -------------------------------
+// ----------------------------------
 // START SERVER
-// -------------------------------
+// ----------------------------------
 
-async function startServer() {
-  try {
-    await loadData();
+app.listen(PORT, () => {
+  console.log(
+    `MyVoice AI backend running at http://localhost:${PORT}`
+  );
 
-    app.listen(PORT, () => {
-      console.log(
-        `MyVoice AI backend running at http://localhost:${PORT}`
-      );
-
-      console.log("AI Model: gemini-flash-lite-latest");
-      console.log("Saved expenses:", database.expenses.length);
-      console.log("Saved tasks:", database.tasks.length);
-    });
-
-  } catch (error) {
-    console.error("Failed to start backend:", error);
-    process.exit(1);
-  }
-}
-
-startServer();
+  console.log("AI Model: gemini-flash-lite-latest");
+  console.log("Database: Supabase PostgreSQL");
+  console.log("Authentication: Supabase Auth");
+});

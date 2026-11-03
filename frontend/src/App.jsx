@@ -1,10 +1,15 @@
 
 import { useState, useEffect, useCallback } from "react";
 import "./App.css";
+import Auth from "./Auth";
+import { supabase } from "./supabaseClient";
 
 const API_URL = "https://myvoice-ai-backend-mxnh.onrender.com";
 
 function App() {
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
   const [transcript, setTranscript] = useState("");
   const [listening, setListening] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -14,6 +19,36 @@ function App() {
   const [tasks, setTasks] = useState([]);
   const [activeTab, setActiveTab] = useState("Dashboard");
   const [dataLoading, setDataLoading] = useState(true);
+
+  // Restore login session and listen for login/logout changes
+  useEffect(() => {
+    let mounted = true;
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      if (mounted) {
+        setSession(newSession);
+        setDataLoading(true);
+      }
+    });
+
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return;
+
+      if (error) {
+        console.error("Session error:", error.message);
+      }
+
+      setSession(data.session);
+      setAuthLoading(false);
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
 
   // Calculate dashboard statistics
   const totalExpenses = expenses.reduce(
@@ -38,32 +73,47 @@ function App() {
     window.speechSynthesis.speak(speech);
   };
 
-  // Load expenses and tasks directly from backend
+  // Load only the logged-in user's expenses and tasks
   const refreshDashboard = useCallback(async () => {
+    if (!session?.access_token) return;
+
     try {
-      const response = await fetch(`${API_URL}/api/data`);
+      const response = await fetch(`${API_URL}/api/data`, {
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+        },
+      });
 
       if (!response.ok) {
-        throw new Error("Could not load dashboard data.");
+        throw new Error(
+          response.status === 401
+            ? "Session expired. Please log in again."
+            : "Could not load dashboard data."
+        );
       }
 
       const result = await response.json();
 
       setExpenses(Array.isArray(result.expenses) ? result.expenses : []);
       setTasks(Array.isArray(result.tasks) ? result.tasks : []);
-
     } catch (error) {
       console.error("Dashboard refresh failed:", error);
-      setMessage("Unable to load saved data. Check your backend.");
+      setMessage(error.message || "Unable to load saved data.");
     } finally {
       setDataLoading(false);
     }
-  }, []);
+  }, [session?.access_token]);
 
-  // Load saved data when application opens
+  // Load saved data after login
   useEffect(() => {
-    refreshDashboard();
-  }, [refreshDashboard]);
+    if (session?.access_token) {
+      refreshDashboard();
+    } else if (!authLoading) {
+      setExpenses([]);
+      setTasks([]);
+      setDataLoading(false);
+    }
+  }, [session?.access_token, authLoading, refreshDashboard]);
 
   // Start microphone
   const startListening = () => {
@@ -110,7 +160,7 @@ function App() {
     }
   };
 
-  // Send command to Gemini backend
+  // Send command to Gemini backend using the user's access token
   const handleSubmit = async () => {
     if (!transcript.trim()) {
       setMessage("Please speak or enter a command first.");
@@ -118,6 +168,11 @@ function App() {
     }
 
     if (loading) return;
+
+    if (!session?.access_token) {
+      setMessage("Please log in again.");
+      return;
+    }
 
     setLoading(true);
     setMessage("MyVoice AI is thinking...");
@@ -127,6 +182,7 @@ function App() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
         },
         body: JSON.stringify({
           command: transcript.trim(),
@@ -141,7 +197,6 @@ function App() {
 
       setMessage(result.message);
 
-      // Update frontend using actual backend response
       if (Array.isArray(result.expenses)) {
         setExpenses(result.expenses);
       }
@@ -150,21 +205,12 @@ function App() {
         setTasks(result.tasks);
       }
 
-      // Speak confirmation
       speak(result.message);
-
-      // Clear command after successful processing
       setTranscript("");
-
     } catch (error) {
       console.error("Command error:", error);
-
-      setMessage(
-        error.message || "Unable to connect to the backend."
-      );
-
+      setMessage(error.message || "Unable to connect to the backend.");
       speak("Sorry, something went wrong.");
-
     } finally {
       setLoading(false);
     }
@@ -175,6 +221,39 @@ function App() {
     setActiveTab(tab);
     refreshDashboard();
   };
+
+  // Log out
+  const handleLogout = async () => {
+    const { error } = await supabase.auth.signOut();
+
+    if (error) {
+      setMessage("Unable to log out. Please try again.");
+      console.error("Logout error:", error.message);
+    } else {
+      setTranscript("");
+      setExpenses([]);
+      setTasks([]);
+      setActiveTab("Dashboard");
+
+      if ("speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    }
+  };
+
+  // Authentication loading screen
+  if (authLoading) {
+    return (
+      <div className="app" style={{ display: "grid", placeItems: "center" }}>
+        <h2>Loading MyVoice AI...</h2>
+      </div>
+    );
+  }
+
+  // Show login/signup when the user is not logged in
+  if (!session) {
+    return <Auth />;
+  }
 
   return (
     <div className="app">
@@ -220,7 +299,21 @@ function App() {
             <p>Your personal AI assistant</p>
           </div>
 
-          <div className="profile">👤</div>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <span>
+              {session.user?.user_metadata?.full_name ||
+                session.user?.email}
+            </span>
+
+            <button
+              className="profile"
+              onClick={handleLogout}
+              title="Log out"
+              aria-label="Log out"
+            >
+              ↪
+            </button>
+          </div>
         </header>
 
         {activeTab === "Dashboard" && (
@@ -279,9 +372,7 @@ function App() {
                     💰 {expense.description} — ₹
                     {Number(expense.amount).toLocaleString("en-IN")}
                     <small> ({expense.category})</small>
-                    <small>
-                      {" "} • {expense.date?.split("T")[0]}
-                    </small>
+                    <small>{" "} • {expense.date?.split("T")[0]}</small>
                   </div>
                 </div>
               ))
@@ -316,6 +407,8 @@ function App() {
             <p>MyVoice AI — Version 1.0</p>
             <p>Speech recognition language: English (India)</p>
             <p>AI engine: Google Gemini Flash Lite</p>
+            <p>Account: {session.user?.email}</p>
+            <button onClick={handleLogout}>Log out</button>
           </section>
         )}
 
