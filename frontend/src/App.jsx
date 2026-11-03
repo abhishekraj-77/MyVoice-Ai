@@ -2,7 +2,7 @@
 import { useState, useEffect, useCallback } from "react";
 import "./App.css";
 
-const API_URL = "http://localhost:5000";
+const API_URL = "https://myvoice-ai-backend-mxnh.onrender.com";
 
 function App() {
   const [transcript, setTranscript] = useState("");
